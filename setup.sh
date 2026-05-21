@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -e
+set -e  # Script bei Fehler beenden
 
 echo "========================================="
 echo "RaceResult RFID Middleware - Setup"
@@ -10,14 +10,43 @@ echo "========================================="
 echo "📦 Update System..."
 sudo apt update
 sudo apt upgrade -y
-sudo apt install -y python3-pip python3-venv sqlite3 nginx curl git build-essential python3-dev
+sudo apt install -y python3-pip sqlite3 nginx curl git build-essential python3-dev dphys
 
 # Schritt 2: Swap erhöhen
 echo "💾 Konfiguriere Swap..."
-sudo dphys-swapfile swapoff 2>/dev/null || true
-sudo sed -i 's/CONF_SWAPSIZE=100/CONF_SWAPSIZE=512/g' /etc/dphys-swapfile
-sudo dphys-swapfile setup
-sudo dphys-swapfile swapon
+#sudo dphys-swapfile swapoff 2>/dev/null || true
+#sudo sed -i 's/CONF_SWAPSIZE=100/CONF_SWAPSIZE=512/g' /etc/dphys-swapfile
+#sudo dphys-swapfile setup
+#sudo dphys-swapfile swapon
+
+echo "🔄 Starte rpi-swap Konfiguration..."
+
+# SWAP Installation
+if ! command -v rpi-swap &> /dev/null; then
+    echo "📦 Installiere rpi-swap..."
+    sudo apt-get update
+    sudo apt-get install -y rpi-swap
+else
+    echo "✅ rpi-swap bereits installiert"
+fi
+
+# SWAP: Aktuellen Swap deaktivieren (falls vorhanden)
+echo "⏹️  Deaktiviere aktuellen Swap..."
+sudo rpi-swap off 2>/dev/null || true
+
+# SWAP: Swap-Größe auf 512 MB setzen
+echo "⚙️  Setze Swap-Größe auf 512 MB..."
+sudo rpi-swap set 512
+
+# SWAP: Swap aktivieren
+echo "▶️  Aktiviere Swap..."
+sudo rpi-swap on
+
+# SWAP: Status anzeigen
+echo "📊 Swap-Status:"
+sudo rpi-swap status
+
+echo "✅ rpi-swap Konfiguration abgeschlossen!"
 
 # Schritt 3: Projektverzeichnis
 echo "📁 Erstelle Verzeichnisse..."
@@ -32,7 +61,6 @@ echo "📥 Generiere Dateien..."
 # Soweit möglich, werden alle Dateien im Skript create_files.sh erstellt
 
 . ./create_files.sh
-
 
 # Installieren
 pip install --upgrade pip setuptools wheel
