@@ -89,10 +89,6 @@ EOF
 ###############################
 
 sudo cat > ~/raceresult-middleware/nginx/nginx.conf << 'EOF'
-user www-data;
-worker_processes auto;
-error_log /var/log/nginx/error.log warn;
-pid /var/run/nginx.pid;
 
 upstream raceresult_backend {
     server 127.0.0.1:5000;
