@@ -1,0 +1,903 @@
+ANFORDERUNGSSPEZIFIKATION                                                                        
+RaceResult RFID Integration mit Invelion E710 Reader-System        
+[TCP/IP-Kommunikation]                                                                                                      
+RASPBERRY PI 3 OPTIMIERT                                
+
+ZIEL:
+  Entwickle ein Softwaresystem zur Erfassung und Synchronisierung von RFID-Daten 
+  (Sportveranstaltungen: Läufer mit RFID-Chips) mit der RaceResult API.
+
+HARDWARE:
+  - Invelion E710 RAIN RFID Reader (UHF, 950 Tags/Sekunde)
+  - Kommunikation: TCP/IP Netzwerkverbindung (Host/Port)
+  - Zielplattform: Raspberry Pi3 (Linux armv7l, 1GB RAM, Single-Core CPU)
+  - Alternativ: Windows/Linux Server-System
+  - Netzwerk: LAN/Ethernet mit bekannter IP-Adresse des Readers
+    
+  INVELION E710 (UNSER READER):
+    - LLRP Protocol (Low Level Reader Protocol - Standard)
+    - Einfachere TCP/IP Kommunikation
+    - Direkte Tag-Report Events
+    - Lightweight für Raspberry Pi3
+    - Open Standard (nicht proprietÃ¤r)
+
+Ressourcen (RPi3):
+  - CPU: ARMv7 Single-Core 1.2 GHz
+  - RAM: 1 GB (KRITISCH!)
+  - Storage: SD-Karte (IOPS-begrenzt)
+  - Network: 100 Mbps Ethernet
+
+Anforderungen:
+  - Multi-threading: Maximal 4 Worker Threads
+  - Memory: < 200MB für E710 Integration (nicht 500MB)
+  - Queue Size: Max 5000 Items (nicht 10000)
+  - Batch Size: 30 Items statt 50 (weniger Memory)
+  - Database: SQLite (nicht PostgreSQL für Dev)
+  - Logging: Syslog statt File Rotation (SD-Karte Schonung)
+  - Metrics: Prometheus optional (zu schwer für RPi3)
+
+
+DETAILLIERTE ANFORDERUNGEN
+
+## 1. INVELION E710 TCP/IP HARDWARE-INTEGRATION
+
+AUFGABE 1.1: TCP/IP Socket Connection Manager (RPi3-optimiert)
+
+  Input:
+    - Reader IP: z.B. "192.168.1.100"
+    - Reader Port: typischerweise 5084 (LLRP Protocol Port)
+    - Timeout: 10 Sekunden für Connection Establishment
+    - Keep-Alive: Heartbeat alle 30 Sekunden
+  
+  Output:
+    - Socket Connection Handle für bi-direktionale Kommunikation
+    - Connection State Monitoring
+    - Automatic Reconnection Handler
+  
+  Requirements (RPi3-SPEZIFISCH):
+    - TCP Socket mit Non-blocking I/O (Python threading, NICHT asyncio!)
+    - Connection Pool: MAX. 2-3 Verbindungen (RAM-Limit!)
+    - Graceful Shutdown bei Disconnect
+    - Auto-Reconnect bei Timeout (exponential backoff: 1s â†’ 32s)
+    - Maximal 5 Reconnect-Versuche, dann Critical Alert
+    - Network Error Handling (Connection Refused, Timeout, Reset)
+    - Socket Buffer: 65536 Bytes (RPi3-optimiert, nicht 1MB!)
+    - TCP Keep-Alive: Enabled
+    - Memory Footprint: < 20MB für Connection Manager
+    
+  Implementierungsdetail:
+    - Nutze Python `socket` library (leichter als asyncio!)
+    - Simple Thread Pool (max 2-3 Worker Threads)
+    - NO asyncio (zu RAM-intensiv für RPi3!)
+    - SSL/TLS optional (nicht prioritÃ¤r)
+    - DNS Caching (SD-Karte I/O sparen)
+    - Connection Metrics (kept minimal)
+    - Memory Pooling für Socket Buffers
+  
+  WARNUNG:
+    âš ï¸  NICHT asyncio.create_connection() verwenden!
+    âš ï¸  NICHT groÃŸe Queues (max 5000 Items)
+    âš ï¸  NICHT mehr als 2 Reader Threads parallel
+  
+  Dateien:
+    â†’ Neu: e710_tcp_connection_manager.py
+    â†’ Neu: e710_connection_pool.py (vereinfacht)
+
+
+AUFGABE 1.2: LLRP Protocol Implementation (NICHT LTK!)
+
+  âš ï¸  WICHTIG: Invelion E710 nutzt LLRP, NICHT LTK!
+  
+  LLRP (Low Level Reader Protocol):
+    - Open Standard (ISO/IEC 29143)
+    - Einfacher als LTK
+    - Binary Protocol mit klarer Struktur
+    - Weniger Overhead
+    - Ideal für Embedded Systeme (RPi3)
+  
+  LLRP Message Structure:
+  
+
+  â”‚  Header  â”‚  Length  â”‚   Type   â”‚  Payload â”‚
+  â”‚  (3B)    â”‚  (4B)    â”‚  (1B)    â”‚  (Var)   â”‚
+  â”‚ 0x04 ... â”‚ 0x00 ... â”‚ 0x01 ... â”‚  ......  â”‚
+  
+  Implementiere diese Commands:
+
+  â”Œâ”€ SET_READER_CONFIG
+  â”‚  - Initialisiere Reader
+  â”‚  - Setze Antennen-Einstellungen
+  â”‚  - Konfiguriere Tag-Report Format
+  â”‚
+  â”œâ”€ ADD_ROSPEC
+  â”‚  - ROSPEC Definition (Read Operation Specification)
+  â”‚  - Setze Suchparameter
+  â”‚  - Antenne + Frequenz Konfiguration
+  â”‚
+  â”œâ”€ ENABLE_ROSPEC
+  â”‚  - Starte Tag-Leseprozess
+  â”‚
+  â”œâ”€ DISABLE_ROSPEC
+  â”‚  - Stoppe Tag-Leseprozess
+  â”‚
+  â”œâ”€ KEEP_ALIVE (Heartbeat)
+  â”‚  - Sent: Alle 30 Sekunden
+  â”‚  - Response: Heartbeat ACK
+  â”‚  - Timing: MUSS zuverlÃ¤ssig sein!
+  â”‚
+  â””â”€ RO_ACCESS_REPORT (Asynchrone Tag-Events)
+     - Kontinuierlich vom Reader
+     - Array von Tag-Reads
+     - EPC, TID, RSSI, Antenna, Timestamp
+  
+  Implementierungsdetail:
+    - LLRP Frame Encoding/Decoding (Binary)
+    - CRC16 Checksummen-Validierung (einfacher als CRC32!)
+    - Message ID Tracking (für Request/Response)
+    - Timeout-Handling (max 5 Sekunden)
+    - Asynchrone Report Handling
+    - Error Code Interpretation (LLRP-Standard)
+    - Memory-efficient Parser (keine groÃŸen Objekte)
+  
+  WICHTIG:
+    âš ï¸  LLRP = Open Standard, nicht proprietÃ¤r
+    âš ï¸  Einfacher zu debuggen (Standard Tools)
+    âš ï¸  Weniger Memory-Overhead als LTK
+  
+  Dateien:
+    â†’ Neu: e710_llrp_protocol.py
+    â†’ Neu: e710_llrp_frame_parser.py
+    â†’ Neu: e710_llrp_commands.py
+
+
+AUFGABE 1.3: Asynchrone Tag-Event Stream Handler (Lightweight)
+
+  Problem:
+    TCP/IP sendet RO_ACCESS_REPORTs asynchron (kontinuierlich).
+    Auf RPi3 begrenzte CPU/RAM für Threads.
+  
+  Lösung: Minimale Thread-Architektur
+  
+  Architektur (RPi3-OPTIMIERT):
+  
+    Main Thread
+         â†“
+    Command Queue (Queue.Queue)
+         â†“ â†‘
+    TCP Reader (1 Thread) â† â†’ TCP Writer (shared connection!)
+                              â†“
+                         Tag Event Parser
+                              â†“
+                         Event Queue (max 5000)
+                              â†“
+                         Sync Worker (1-2 Threads)
+  
+  Implementierungsdetail:
+    - 1 Thread für TCP Reading (blocking, einfach)
+    - Shared Connection für Write (kein extra Writer Thread!)
+    - Event Queue (Thread-safe, begrenzte GröÃŸe)
+    - Exception Handling in Reader Thread
+    - Buffer für Event-Payloads (reuse!)
+    - Event Validation (CRC)
+    - KEIN komplexes Event-Listener Pattern
+    - KEIN Thread Pool (zu viel Overhead)
+  
+  Memory Target: < 100MB für Stream Handler
+  
+
+
+AUFGABE 1.4: Tag-Daten Parser aus LLRP Reports
+
+  Empfangene RO_ACCESS_REPORT vom Invelion E710:
+  
+  Beispiel Event Struktur:
+  {
+    "message_type": "RO_ACCESS_REPORT",
+    "timestamp": 1716383045123,
+    "tags": [
+      {
+        "epc": "AABBCCDD11223344",         # EPC-ID (16 Zeichen, Hex)
+        "tid": "EEFF00112233",             # TID (optional)
+        "rssi": -65,                       # SignalstÃ¤rke (dBm)
+        "antenna": 1,                      # Antenne 1-4
+        "timestamp": 1716383045123,        # Millisekunden seit Epoch
+        "phase": 3645,                     # Phase (optional)
+        "doppler": 0                       # Velocity (optional)
+      },
+      {
+        "epc": "1122DDCC44332211",
+        "rssi": -70,
+        "antenna": 2,
+        "timestamp": 1716383045150
+      }
+    ]
+  }
+  
+  Implementierungsdetail:
+    - Parse Binary LLRP Frame â†’ strukturierte Daten
+    - Validiere EPC-Format (8+ Bytes)
+    - Validiere RSSI (-100 bis 0 dBm)
+    - Validiere Antenna (1-4)
+    - Timestamp-Validierung
+    - Error Logging minimal (syslog!)
+    - Memory-efficient (object reuse)
+    - Corrupt Tag Handling
+  
+  WICHTIG FÜR RPi3:
+    âŒ NICHT jeden Tag einzeln verarbeiten
+    - Batch-weise verarbeiten (bis zu 10 Tags)
+    - Objekt-Pooling für Tag-Daten
+    - Minimales Logging (syslog für RPi3)
+  
+  Dateien:
+    â†’ Neu: e710_tag_event_parser.py
+
+
+AUFGABE 2.1: Network Discovery & Configuration
+
+  Lösung für RPi3:
+    - mDNS/Bonjour Discovery (Invelion E710 supportiert)
+    - UDP Broadcast Scanner (Port 5084)
+    - Manual IP Configuration (Fallback)
+    - KEIN komplexes zeroconf (zu schwer)
+  
+  Implementierungsdetail:
+    - Simple UDP Broadcast Scan
+    - Cache in SQLite (nicht RAM!)
+    - DNS Resolution mit Timeout
+    - Minimal Logging
+  
+  Dateien:
+    â†’ Neu: e710_network_discovery.py
+
+
+AUFGABE 2.2: Connection Stability & Heartbeat
+
+  Heartbeat ERFORDERT:
+    - KEEPALIVE alle 30 Sekunden
+    - Response < 5 Sekunden
+    - 3 Misses â†’ Reconnect
+  
+  RPi3-Optimierung:
+    - Timer-basiert (threading.Timer)
+    - Shared TCP Connection (kein extra Thread!)
+    - Minimal Metrics
+    - Syslog Logging
+  
+  Dateien:
+    â†’ Neu: e710_heartbeat_monitor.py (vereinfacht)
+
+
+AUFGABE 2.3: TCP Buffer Management (RPi3-optimiert)
+
+  Problem:
+    - RPi3 begrenzte Network I/O
+    - Reader kann 100+ Tags pro Report schicken
+    - SD-Karte Bottleneck bei groÃŸen Buffers
+  
+  Lösung:
+    - Buffer: 65536 Bytes (nicht 1MB!)
+    - SO_RCVBUF optimiert für RPi3
+    - Partial Message Handling
+    - LLRP Message Framing
+  
+  Performance:
+    - 950 Tags/Sec möglich
+    - Aber auf RPi3 gemiddelt (nicht Peak!)
+  
+  Dateien:
+    â†’ Aktualisieren: e710_tcp_connection_manager.py
+
+
+AUFGABE 2.4: Network Error Handling & Recovery
+
+  Error Szenarien (wie zuvor):
+    - Connection Refused â†’ Retry
+    - Timeout â†’ Reconnect
+    - Connection Reset â†’ Recovery
+    - Partial Message â†’ Buffer
+    - CRC Error â†’ Discard + Log
+    
+  RPi3-Spezifisch:
+    âŒ NICHT zu viel Logging (SD-Karte!)
+    - Syslog statt File
+    - Exponential Backoff (bewÃ¤hrt)
+    - Health Checks minimal
+  
+  Dateien:
+    â†’ Neu: e710_network_error_handler.py
+
+
+
+## 3. DATEN-TRANSFORMATION & VALIDIERUNG
+
+AUFGABE 3.1: E710 LLRP-Daten zu RaceResult-Format
+  
+  Eingabe: LLRP RO_ACCESS_REPORT
+  Ausgabe: RaceResult API Format
+  
+  EPC â†’ BIB Mapping
+  Antenna â†’ Split-Point
+  Validierungen (Standard)
+  
+  Dateien:
+    â†’ Neu: e710_to_raceresult_mapper.py
+    â†’ Aktualisieren: RaceResult_Sync_Engine.py
+
+
+AUFGABE 3.2: Duplikat-Erkennung (RPi3-optimiert)
+
+  Problem:
+    - 950 Tags/Sec generieren viele Duplikate
+    - RPi3 RAM-Limit für Duplikat-Register
+  
+  Lösung:
+    - Sliding Window: 2 Sekunden
+    - In-Memory Register (maximal 1000 EintrÃ¤ge!)
+    - Auto-Cleanup alte EintrÃ¤ge
+    - RSSI Quality Check
+  
+  Memory Footprint: < 5MB für Dedup Register
+  
+  Dateien:
+    â†’ Neu: e710_deduplication.py (speicheroptimiert)
+
+
+## 4. DATABASE & PERSISTENZ (RPi3-optimiert)
+
+AUFGABE 4.1: RFID-Register Struktur (SQLite für RPi3)
+
+  Tabellen (wie zuvor):
+    - rfid_registrations
+    - rfid_reads
+    - race_results
+    - reader_connection_log
+  
+  RPi3-Optimierung:
+    âš ï¸  SQLite ONLY (nicht PostgreSQL für Dev)
+    âš ï¸  WAL Mode für bessere Concurrency
+    âš ï¸  Indexes essential (zu wenig RAM für Scan!)
+    âš ï¸  Automatic VACUUM (nicht aggressive!)
+    âš ï¸  Cleanup: Ã¤lter als 24h (sparen SD-Karte)
+    âš ï¸  Connection Pool: max 3 Connections
+    âš ï¸  Batch Inserts: Maximal 30 Items
+  
+  Database Size Management:
+    - Target: < 500MB auf SD-Karte
+    - Automated Cleanup nach 24h
+    - Logging minimal (syslog)
+  
+  Dateien:
+    â†’ Neu: e710_database.py (SQLite-optimiert)
+    â†’ Neu: e710_database_models.py
+
+
+## 5. ECHTZEIT-VERARBEITUNG & STREAMING (RPi3-optimiert)
+AUFGABE 5.1: Asynchrone Event-Processing Pipeline (Lightweight)
+
+  RPi3-Constraint: MAX 3-4 Worker Threads!
+  
+  Architektur (vereinfacht):
+  
+    TCP Reader Thread (1)
+         â†“
+    Event Parser (inline/no thread)
+         â†“
+    Deduplicator (inline)
+         â†“
+    Mapper (inline)
+         â†“
+    Batch Queue
+         â†“
+    Sync Worker (1-2 Threads)
+  
+  Optimierungen:
+    - Minimal Thread Count (nicht 6 wie bei Server!)
+    - Inline Processing wo möglich
+    - Batch Processing (30er Batches)
+    - Queue-basierte Kommunikation
+    âŒ KEIN komplexes Pipeline Pattern
+    âŒ KEIN Thread Pool
+  
+  Performance:
+    - Durchsatz: 200-300 Reads/Sec auf RPi3 (nicht 950!)
+    - Latenz: < 500ms (gemiddelt)
+    - Queue Max: 5000 Items
+  
+  Dateien:
+    â†’ Aktualisieren: RaceResult_Sync_Engine.py (RPi3-optimiert)
+    â†’ Neu: e710_event_processing_pipeline.py (lean)
+
+
+AUFGABE 5.2: Fehlerbehandlung & Resilience
+
+  (Identisch wie zuvor)
+  
+  - Circuit Breaker Pattern
+  - Exponential Backoff
+  - Health Checks
+  - Dead Letter Queue
+  
+  RPi3-Spezifisch:
+    - Minimal Logging (syslog!)
+    - Keine groÃŸe Error Objects
+    - Graceful Degradation
+  
+  Dateien:
+    â†’ Neu: e710_error_handler.py
+    â†’ Neu: e710_health_monitor.py
+
+
+## 6. KONFIGURATION & DEPLOYMENT (RPi3)
+AUFGABE 6.1: Konfigurationsverwaltung
+
+  .env Datei (RPi3-optimiert):
+  
+  # INVELION E710 READER (TCP/IP, LLRP)
+  E710_READER_HOST=192.168.1.100        # Reader IP
+  E710_READER_PORT=5084                 # LLRP Port
+  E710_READER_TIMEOUT=10
+  E710_KEEPALIVE_INTERVAL=30            # KRITISCH!
+  E710_MAX_RECONNECT_ATTEMPTS=5
+  E710_RECONNECT_BACKOFF_MAX=32
+  E710_TCP_RECV_BUFFER_SIZE=65536       # NICHT 1MB!
+  E710_TCP_SEND_BUFFER_SIZE=65536
+  
+  # RPi3 SPEZIFIC
+  E710_MAX_THREADS=3                    # RPi3 Limit!
+  E710_QUEUE_MAX_SIZE=5000              # RAM Limit
+  E710_BATCH_SIZE=30                    # NICHT 50!
+  E710_BATCH_TIMEOUT_SEC=2
+  
+  # NETWORK DISCOVERY
+  E710_ENABLE_DISCOVERY=true
+  E710_DISCOVERY_TIMEOUT=30
+  
+  # ANTENNA MAPPING
+  E710_ANTENNA_1_SPLIT=start
+  E710_ANTENNA_2_SPLIT=5km
+  E710_ANTENNA_3_SPLIT=10km
+  E710_ANTENNA_4_SPLIT=finish
+  
+  # FILTERING
+  E710_MIN_RSSI=-80
+  E710_DUPLICATE_WINDOW_MS=2000
+  E710_DEDUP_MAX_SIZE=1000              # RAM!
+  
+  # DATABASE
+  DATABASE_URL=sqlite:///rfid_reads.db  # RPi3!
+  DATABASE_WAL_MODE=true                # Important for concurrency
+  DATABASE_CLEANUP_HOURS=24
+  DATABASE_BATCH_SIZE=30                # NOT 100
+  
+  # RACERESULT API
+  RACERESULT_API_URL=https://api.raceresult.com
+  RACERESULT_API_KEY=your-api-key
+  RACERESULT_EVENT_ID=event-123
+  RACERESULT_BATCH_SIZE=30              # Smaller batches
+  
+  # LOGGING (RPi3!)
+  LOG_LEVEL=INFO
+  LOG_TARGET=syslog                     # NICHT file!
+  LOG_FORMAT=json
+  
+  # MONITORING
+  METRICS_ENABLED=false                 # TOO HEAVY for RPi3!
+  HEALTH_CHECK_INTERVAL=60
+    
+  Anforderungen:
+    - Config Validation
+    - Host/Port Check
+    - Resource Limits Check (RPi3!)
+    - Hot-Reload minimal
+    - Encrypted API Keys
+  
+  Dateien:
+    â†’ Neu: e710_config.py (RPi3-aware)
+    â†’ Neu: e710_config_validation.py
+    â†’ Beispiel: .env.example.rpi3
+
+## 7. MONITORING & OBSERVABILITY (RPi3-lightweight)
+
+AUFGABE 7.1: Netzwerk- & Connection Metriken (Minimal)
+
+  Kritische Metriken (RPi3):
+  
+  â”‚ Metrik                    â”‚ Target â”‚ Alert     â”‚
+  â”‚ TCP Connection Status     â”‚ UP     â”‚ DOWN>30s  â”‚
+  â”‚ Heartbeat Response Time   â”‚ <100ms â”‚ >1000ms   â”‚
+  â”‚ Missed Heartbeats         â”‚ 0      â”‚ >2 in 5m  â”‚
+  â”‚ Tags Received/sec         â”‚ >100   â”‚ <10       â”‚
+  â”‚ Event Parse Success Rate  â”‚ >99%   â”‚ <95%      â”‚
+  â”‚ Queue Depth               â”‚ <2000  â”‚ >4000     â”‚
+  â”‚ Memory Usage              â”‚ <200MB â”‚ >250MB    â”‚
+  â”‚ CPU Usage                 â”‚ <50%   â”‚ >70%      â”‚
+
+  Implementierung:
+    - Syslog für Logging (nicht File!)
+    - Dashboard: Simple HTTP Endpoint (NOT Prometheus!)
+    - Alerts: Email nur bei Critical
+    - KEINE Prometheus (zu schwer für RPi3)
+    - KEINE Grafana
+  
+  Dateien:
+    â†’ Neu: e710_metrics.py (simplified)
+    â†’ Neu: e710_health_endpoint.py (HTTP, light)
+
+
+AUFGABE 7.2: Logging & Debugging (RPi3-optimiert)
+
+  Log-Ziel: SYSLOG (nicht Datei!)
+  
+  Log-Struktur (Syslog/JSON):
+  
+  {
+    "timestamp": "2026-05-22T10:30:45.123Z",
+    "level": "INFO",
+    "component": "e710_tcp_connection_manager",
+    "message": "Connected to E710 Reader",
+    "data": {
+      "host": "192.168.1.100",
+      "port": 5084,
+      "connection_time_ms": 125
+    }
+  }
+  
+  Spezielle Logs:
+    - Connection Events: CONNECT, DISCONNECT, RECONNECT
+    - Heartbeat Events: SENT, RESPONSE, MISSED
+    - LLRP Protocol: FRAME_RECEIVED, PARSE_ERROR
+    - Network Errors: CONNECTION_REFUSED, TIMEOUT
+    - Queue Status: OVERFLOW alerts only!
+  
+  RPi3-Optimierung:
+    - Syslog (nicht Rotation!)
+    - Minimal Details
+    - No Stack Traces by default
+    - Buffer Log (kein I/O bei jedem Log)
+  
+  Dateien:
+    â†’ Neu: e710_logger.py (syslog-based)
+
+
+AUFGABE 8.1: Unit Tests für Invelion E710
+
+  Coverage: 80%+ (nicht 85% für RPi3 Load!)
+  
+  Test-Kategorien:
+  
+  1ï¸âƒ£ TCP Connection Manager Tests
+    - Connect erfolgreich
+    - Timeout Handling
+    - Auto-Reconnect
+    - Pool Limits
+    - Graceful Shutdown
+  
+  2ï¸âƒ£ LLRP Protocol Tests (NICHT LTK!)
+    - Frame Encoding
+    - Frame Decoding
+    - CRC16 Validation (einfacher!)
+    - Message ID Tracking
+    - Report Parsing
+  
+  3ï¸âƒ£ Heartbeat Tests
+    - Keepalive Interval
+    - Response Detection
+    - Timeout Handling
+    - Missed Counter
+  
+  4ï¸âƒ£ Event Listener Tests
+    - Report Detection
+    - Message Buffering
+    - Queue Push
+    - Thread Safety
+  
+  5ï¸âƒ£ Tag Parser Tests
+    - Valid Report Parse
+    - Multiple Tags
+    - Corrupt Handling
+    - Validation
+  
+  6ï¸âƒ£ Dedup Tests
+    - Duplicate Detection
+    - Window Logic
+    - RSSI Quality
+    - Memory Limits
+  
+  7ï¸âƒ£ Integration Tests
+    - E2E: Connection â†’ Parse â†’ Dedup â†’ DB
+    - Mock LLRP Server
+    - Multiple Events
+    - Network Failures
+    - Heartbeat Recovery
+  
+  8ï¸âƒ£ RPi3-spezifische Tests
+    - Memory Limits
+    - Thread Limits
+    - Queue Overflow
+    - SD-Karte I/O
+  
+  Dateien:
+    â†’ Neu: tests/test_e710_tcp_connection.py
+    â†’ Neu: tests/test_e710_llrp_protocol.py
+    â†’ Neu: tests/test_e710_heartbeat.py
+    â†’ Neu: tests/test_e710_event_listener.py
+    â†’ Neu: tests/test_e710_tag_parser.py
+    â†’ Neu: tests/test_e710_deduplication.py
+    â†’ Neu: tests/test_e710_integration.py
+    â†’ Neu: tests/test_e710_rpi3_resources.py
+
+
+AUFGABE 8.2: Load Testing (RPi3-realistische Szenarien)
+
+  Ziel: Validiere StabilitÃ¤t auf RPi3
+  
+  Szenarien:
+    - 200-300 Tags/Sec für 1 Stunde (realistisch RPi3)
+    - 50+ Tags pro LLRP Report
+    - Network Latency 10-50ms (Ethernet)
+    - Intermittent Drops (0.1%)
+    - Continuous Heartbeat
+    - SD-Karte Schreib-I/O
+  
+  Performance Targets (RPi3):
+    - CPU: < 50% Single-Core
+    - Memory: < 200MB steady state
+    - Latency p99: < 500ms Event â†’ DB
+    - Throughput: 200+ Tags/sec sustained
+    - Uptime: > 24 Stunden ohne Crash
+  
+  Tools:
+    - pytest-benchmark
+    - Custom Python Load Script
+    - Syslog Monitoring
+  
+  Dateien:
+    â†’ Neu: tests/test_e710_load_rpi3.py
+
+Dokumentation
+AUFGABE 9.1: Technische Dokumentation
+
+  1. Invelion E710 TCP/IP Network Setup
+     - Reader Network Config
+     - IP Konfiguration
+     - Firewall (Port 5084)
+     - mDNS Discovery
+  
+  2. LLRP Protocol Reference (NICHT LTK!)
+     - LLRP Message Format
+     - SET_READER_CONFIG
+     - ADD_ROSPEC
+     - ENABLE_ROSPEC
+     - RO_ACCESS_REPORT
+     - KEEP_ALIVE
+     - Error Codes
+  
+  3. Raspberry Pi3 Deployment Guide
+     - OS Setup (Raspberry Pi OS Lite)
+     - Python Installation (3.7+)
+     - Dependencies (minimal)
+     - SD-Karte Optimization
+     - Performance Tuning
+     - Systemd Service Setup
+  
+  4. Connection Architecture
+     - State Machine
+     - Heartbeat Mechanism
+     - Reconnection Strategy
+  
+  5. Troubleshooting Guide
+     - Network Issues (RPi3-spezifisch!)
+     - LLRP Parsing Errors
+     - Heartbeat Failures
+     - Memory/CPU Issues
+     - SD-Karte I/O Bottlenecks
+  
+  6. Operations Manual
+     - Installation
+     - Startup/Shutdown
+     - Monitoring (syslog!)
+     - Backup Strategy
+     - Update Procedure
+  
+  Dateien:
+    â†’ Neu: E710_INVELION_SETUP.md
+    â†’ Neu: E710_LLRP_PROTOCOL_REFERENCE.md (NOT LTK!)
+    â†’ Neu: E710_RPI3_DEPLOYMENT.md (NEW!)
+    â†’ Neu: E710_CONNECTION_ARCHITECTURE.md
+    â†’ Neu: E710_TROUBLESHOOTING.md
+    â†’ Neu: E710_OPERATIONS_MANUAL.md
+
+
+
+## 10. SECURITY CONSIDERATIONS
+
+AUFGABE 10.1: Sichere Implementierung (RPi3-aware)
+
+  Sicherheit (Standard):
+    - Network Isolation (LAN only!)
+    - API Key Management
+    - Input Validation
+    - Logging Security
+    - Database Security (SQLite)
+    - Thread Safety
+  
+  RPi3-spezifisch:
+    âš ï¸  SD-Karte Encryption (optional)
+    âš ï¸  SSH Key nur (no Password SSH!)
+    âš ï¸  Minimize Logging (weniger SD-Karte Wear)
+    âš ï¸  Regular Backups (SD-Karte Lebensdauer!)
+  
+  Dateien:
+    â†’ Neu: e710_security.py
+    â†’ Neu: SECURITY.md
+
+
+## 11. PERFORMANCE OPTIMIZATION (RPi3-CRITICAL)
+
+AUFGABE 11.1: RPi3-spezifische Optimierungen
+
+  KRITISCH für RPi3:
+  
+  1. Threading (MUSS optimiert sein!)
+     - Max 3 Worker Threads
+     - NO asyncio (GC Heavy!)
+     - Simple Queue.Queue nur
+     - Lock-free where possible
+     - Context Switches minimieren
+  
+  2. Memory Management (200MB Target!)
+     - Object Pooling (reuse Tag Objects)
+     - Limit Queue Sizes
+     - NO Large Data Structures
+     - Garbage Collection Tuning
+     - Periodic Cleanup
+  
+  3. I/O Optimization
+     - Batch Inserts (30er max!)
+     - SQLite WAL Mode
+     - Buffer I/O Operations
+     - Syslog statt File I/O
+     - Network Buffer Tuning
+  
+  4. CPU Optimization
+     - Minimize Busy Loops
+     - CRC16 statt CRC32
+     - Compiled Parsing (Cython optional)
+     - Profile vor Optimization!
+  
+  5. SD-Karte Schonung
+     - Syslog Logging (nicht File!)
+     - Minimal Database Writes
+     - No Log Rotation (nutze syslog)
+     - Regular Backups
+  
+  Performance Targets (REALISTIC):
+    - 200-300 Reads/Sec on RPi3
+    - < 200MB Memory
+    - < 50% CPU Single-Core
+    - 24h+ Uptime
+  
+  Dateien:
+    â†’ Neu: e710_performance_optimization_rpi3.py
+    â†’ Neu: e710_memory_management.py
+    â†’ Neu: e710_io_optimization.py
+
+
+
+âš ï¸ KRITISCHE ANFORDERUNGEN (MUST HAVE - RPi3 Version)
+
+NICHT VERHANDELBAR:
+
+ 1. - TCP/IP Connection stabil (>99% Uptime on RPi3)
+ 2. - LLRP Heartbeat alle 30 Sekunden (NOT optional!)
+ 3. - LLRP Report Parsing fehlerfrei
+ 4. - Keine verlorenen RFID-Events (persistent queue!)
+ 5. - Korrekte EPC â†’ BIB Zuordnung
+ 6. - Timestamps im UTC ISO8601 Format
+ 7. - Duplikat-Erkennung (speicher-limited!)
+ 8. - RaceResult API Sync zuverlÃ¤ssig
+ 9. - Syslog-Logging aktiv
+10. - Database IntegritÃ¤t (SQLite WAL!)
+11. - Secure API Key Management
+12. - Unit Tests mit 80%+ Coverage
+13. - TCP Connection Recovery
+14. - RPi3 Memory < 200MB
+15. - RPi3 CPU < 50% sustained
+16. - 24h Uptime ohne Crash
+
+RASPBERRY PI 3 SETUP (Quick Start)
+
+Voraussetzungen:
+  - Raspberry Pi 3B+ oder 3B
+  - Raspberry Pi OS Lite (headless)
+  - 4GB+ SD-Karte (Class 10)
+  - Ethernet Connection
+  - Python 3.7+
+
+Installation:
+  
+  1. OS Setup:
+     $ sudo apt-get update
+     $ sudo apt-get upgrade
+     $ sudo apt-get install python3 python3-pip git
+  
+  2. Dependencies (Minimal!):
+     $ pip3 install flask sqlalchemy requests pytest
+     $ pip3 install python-dotenv
+  
+  3. E710 Integration Project:
+     $ git clone <repo>
+     $ cd e710-raceresult
+     $ pip3 install -r requirements-rpi3.txt
+  
+  4. Configuration:
+     $ cp .env.example.rpi3 .env
+     $ nano .env  # Set E710_READER_HOST
+  
+  5. Systemd Service:
+     $ sudo cp e710-integration.service /etc/systemd/system/
+     $ sudo systemctl enable e710-integration
+     $ sudo systemctl start e710-integration
+  
+  6. Monitoring:
+     $ journalctl -u e710-integration -f
+
+Performance Baseline Check:
+  
+  $ python3 tests/test_e710_rpi3_resources.py
+  
+  Expected:
+    - Memory: 80-120MB at startup
+    - CPU: 5-10% idle
+    - Database: < 100MB after 1 hour
+
+
+
+SUPPORT & QUESTIONS
+
+Wenn unklar:
+  1. Lese Invelion E710 LLRP Dokumentation
+  2. Überprüfe Raspberry Pi3 Constraints
+  3. Frage nach KlÃ¤rung (Test-Driven!)
+  4. Dokumentiere Entscheidungen
+
+WICHTIGSTE KONTAKTE:
+  - Invelion Support: <to be determined>
+  - LLRP Standard: ISO/IEC 29143
+  - RaceResult API: [provided separately]
+  - Raspberry Pi: https://www.raspberrypi.org/
+
+DEBUGGING TOOLS (RPi3):
+  - netcat: TCP Testing
+  - tcpdump: Packet Capture
+  - sysstat: Performance Monitoring
+  - python3 -m pdb: Debugging
+
+
+Must Read:
+  - Invelion E710 Datasheet
+  - LLRP Protocol Specification (ISO/IEC 29143)
+  - Python socket Programming
+  - TCP/IP Networking
+  - Binary Protocol Parsing
+  - Threading in Python (GIL!)
+  - SQLite Optimization
+  - Raspberry Pi Performance Tuning
+
+RPi3-spezifisch:
+  - ARM CPU Architecture
+  - Memory Management (1GB!)
+  - SD-Karte I/O Optimization
+  - Python GC Tuning
+  - Systemd Services
+  - Syslog Management
+
+Nice to Have:
+  - RFID / EPC Gen2v2 Standard
+  - Circuit Breaker Pattern
+  - Prometheus Metrics
+  - Load Testing
+
+
+
