@@ -15,7 +15,7 @@ EOF
 # Config JSON        #
 ######################
 
-cat > config/config.json << 'EOF'
+cat > ~/raceresult-middleware/config/config.json << 'EOF'
 {
   "readers": [
     {
@@ -71,7 +71,7 @@ EOF
 # Definition der Logrotation einrichten #
 #########################################
 sudo cat > /etc/logrotate.d/raceresult << 'EOF'
-/home/pi/raceresult-middleware/logs/*.log {
+~/raceresult-middleware/logs/*.log {
     daily
     rotate 7
     compress
