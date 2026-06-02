@@ -701,6 +701,10 @@ import socket
 import threading
 import time
 from dotenv import load_dotenv
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 
 # ==================== KONFIGURATION ====================
 
@@ -1001,6 +1005,230 @@ class ReaderListener:
 db = DatabaseManager(DB_PATH)
 listener = ReaderListener(CONFIG_PATH, db)
 
+# Nach der db-Instanz:
+raceresult_api = RaceResultAPIClient()
+
+# Starte regelmäßige Verbindungsprüfung
+def _check_api_connection_periodic():
+    """Background-Thread für API-Verbindungsprüfung"""
+    while True:
+        time.sleep(60)  # Alle 60 Sekunden
+        raceresult_api.check_connection()
+
+api_check_thread = threading.Thread(target=_check_api_connection_periodic, daemon=True)
+
+
+# ==================== RACERESULT API CLIENT ====================
+
+class RaceResultAPIClient:
+    """RaceResult API Client mit Retry-Logik und Error Handling"""
+    
+    def __init__(self):
+        self.api_url = os.getenv('RACERESULT_API_URL', 'https://api.raceresult.com')
+        self.api_key = os.getenv('RACERESULT_API_KEY')
+        self.event_id = os.getenv('RACERESULT_EVENT_ID')
+        self.session = self._create_session()
+        self.last_sync_error = None
+        self.is_connected = False
+        
+        if not self.api_key or not self.event_id:
+            logger.warning("⚠️  RaceResult API nicht vollständig konfiguriert")
+        else:
+            logger.info(f"✓ RaceResult API konfiguriert: Event {self.event_id}")
+    
+    def _create_session(self):
+        """Erstelle requests.Session mit Retry-Strategie für Pi3"""
+        session = requests.Session()
+        
+        # Retry-Strategie: 3 Versuche bei Timeout/Connection-Errors
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST", "GET"]
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        # Timeout für Pi3 (langsame CPU)
+        session.timeout = 30
+        
+        return session
+    
+    def _get_headers(self):
+        """Erstelle Authorization-Header"""
+        return {
+            'Authorization': f'Bearer {self.api_key}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'RaceResult-RFID-Middleware/1.0'
+        }
+    
+    def check_connection(self):
+        """Überprüfe API-Verbindung"""
+        if not self.api_key or not self.event_id:
+            self.is_connected = False
+            return False
+        
+        try:
+            url = f"{self.api_url}/api/v1/events/{self.event_id}"
+            response = self.session.get(
+                url,
+                headers=self._get_headers(),
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                self.is_connected = True
+                logger.info("✓ RaceResult API verbunden")
+                return True
+            else:
+                self.is_connected = False
+                self.last_sync_error = f"HTTP {response.status_code}"
+                logger.warning(f"⚠️  RaceResult API: HTTP {response.status_code}")
+                return False
+        
+        except requests.exceptions.Timeout:
+            self.is_connected = False
+            self.last_sync_error = "Timeout"
+            logger.warning("⚠️  RaceResult API Timeout")
+            return False
+        
+        except requests.exceptions.ConnectionError:
+            self.is_connected = False
+            self.last_sync_error = "Connection Error"
+            logger.warning("⚠️  RaceResult API nicht erreichbar")
+            return False
+        
+        except Exception as e:
+            self.is_connected = False
+            self.last_sync_error = str(e)
+            logger.error(f"✗ RaceResult API Fehler: {e}")
+            return False
+    
+    def submit_reads(self, reads):
+        """
+        Übertrage RFID-Reads zur RaceResult API
+        
+        Args:
+            reads: Liste von Reads mit {id, reader_id, tag_id, timestamp}
+        
+        Returns:
+            (success: bool, synced_ids: list, error: str)
+        """
+        
+        if not self.is_connected:
+            return False, [], "API nicht verbunden"
+        
+        if not reads:
+            return True, [], "Keine Reads zum Synchronisieren"
+        
+        try:
+            # Konvertiere Reads in RaceResult-Format
+            payload = {
+                'event_id': self.event_id,
+                'reads': [
+                    {
+                        'reader_id': r.get('reader_id'),
+                        'tag_id': r.get('tag_id'),
+                        'timestamp': r.get('timestamp'),
+                        'source': 'RFID-Middleware-Pi3'
+                    }
+                    for r in reads
+                ]
+            }
+            
+            # API-Endpoint: Batch-Upload
+            url = f"{self.api_url}/api/v1/events/{self.event_id}/rfid-reads/batch"
+            
+            logger.info(f"📤 Übertrage {len(reads)} Reads zu RaceResult...")
+            
+            response = self.session.post(
+                url,
+                json=payload,
+                headers=self._get_headers(),
+                timeout=30
+            )
+            
+            # Erfolgreiche Antwort
+            if response.status_code in [200, 201, 202]:
+                try:
+                    result = response.json()
+                    synced_count = result.get('synced', len(reads))
+                    synced_ids = [r['id'] for r in reads[:synced_count]]
+                    
+                    logger.info(f"✓ {synced_count} Reads zu RaceResult übertragen")
+                    self.last_sync_error = None
+                    
+                    return True, synced_ids, None
+                
+                except Exception as e:
+                    logger.warning(f"⚠️  Response-Parsing Fehler: {e}")
+                    # Annahme: Alle Reads erfolgreich, da HTTP 200
+                    synced_ids = [r['id'] for r in reads]
+                    return True, synced_ids, None
+            
+            # Client-Fehler (422: Validierung, 401: Auth)
+            elif response.status_code == 422:
+                error_msg = "Validierungsfehler"
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get('message', error_msg)
+                except:
+                    pass
+                
+                logger.error(f"✗ {error_msg}: {response.text[:200]}")
+                self.last_sync_error = error_msg
+                return False, [], error_msg
+            
+            elif response.status_code == 401:
+                error_msg = "Authentifizierungsfehler - Ungültige API-Key"
+                logger.error(f"✗ {error_msg}")
+                self.last_sync_error = error_msg
+                self.is_connected = False
+                return False, [], error_msg
+            
+            # Server-Fehler (retry möglich)
+            elif response.status_code >= 500:
+                error_msg = f"Server-Fehler {response.status_code}"
+                logger.warning(f"⚠️  {error_msg}")
+                self.last_sync_error = error_msg
+                return False, [], error_msg
+            
+            # Unerwarteter Status
+            else:
+                error_msg = f"Unexpected HTTP {response.status_code}"
+                logger.warning(f"⚠️  {error_msg}")
+                self.last_sync_error = error_msg
+                return False, [], error_msg
+        
+        except requests.exceptions.Timeout:
+            error_msg = "Request Timeout"
+            logger.warning(f"⚠️  {error_msg}")
+            self.last_sync_error = error_msg
+            return False, [], error_msg
+        
+        except requests.exceptions.ConnectionError:
+            error_msg = "Netzwerk nicht erreichbar"
+            logger.warning(f"⚠️  {error_msg}")
+            self.last_sync_error = error_msg
+            return False, [], error_msg
+        
+        except Exception as e:
+            error_msg = f"Unerwarteter Fehler: {str(e)}"
+            logger.error(f"✗ {error_msg}")
+            self.last_sync_error = error_msg
+            return False, [], error_msg
+    
+    def get_status(self):
+        """Hole API-Status für Dashboard"""
+        return {
+            'connected': self.is_connected,
+            'api_url': self.api_url,
+            'event_id': self.event_id,
+            'last_error': self.last_sync_error
+        }
 # ==================== API ENDPOINTS ====================
 
 @app.route('/')
@@ -1112,6 +1340,131 @@ def server_error(e):
     logger.error(f"Server Error: {e}")
     return jsonify({'error': 'Internal Server Error'}), 500
 
+@app.route('/api/sync', methods=['POST'])
+def sync_api():
+    """Synchronisiere Daten mit RaceResult API"""
+    
+    # Hole gepufferte Reads
+    unsynced = db.get_unsynced_reads(limit=100)
+    
+    if not unsynced:
+        return jsonify({
+            'synced': 0,
+            'timestamp': datetime.now().isoformat(),
+            'status': 'ok',
+            'message': 'Keine Reads zum Synchronisieren'
+        })
+    
+    # Verbindung prüfen
+    if not raceresult_api.is_connected:
+        logger.warning("⚠️  API nicht verbunden, Retry läuft...")
+        return jsonify({
+            'synced': 0,
+            'timestamp': datetime.now().isoformat(),
+            'status': 'waiting',
+            'message': f'API nicht verfügbar: {raceresult_api.last_sync_error}',
+            'buffered': len(unsynced)
+        }), 503
+    
+    # Übertrage zu RaceResult
+    success, synced_ids, error = raceresult_api.submit_reads(unsynced)
+    
+    if success and synced_ids:
+        # Markiere als synchronisiert
+        db.mark_synced(synced_ids)
+        
+        return jsonify({
+            'synced': len(synced_ids),
+            'timestamp': datetime.now().isoformat(),
+            'status': 'ok',
+            'message': f'{len(synced_ids)} Reads erfolgreich übertragen'
+        })
+    
+    elif success and not synced_ids:
+        # Keine neuen Reads, aber erfolgreich verbunden
+        return jsonify({
+            'synced': 0,
+            'timestamp': datetime.now().isoformat(),
+            'status': 'ok',
+            'message': 'Verbunden, keine Reads zum Übertragen'
+        })
+    
+    else:
+        # Fehler bei Übertragung
+        return jsonify({
+            'synced': 0,
+            'timestamp': datetime.now().isoformat(),
+            'status': 'error',
+            'error': error,
+            'buffered': len(unsynced),
+            'message': f'Sync fehlgeschlagen: {error}'
+        }), 502
+
+@app.route('/api/status')
+def get_status():
+    """System-Status inkl. RaceResult API"""
+    stats = db.get_stats()
+    api_status = raceresult_api.get_status()
+    
+    return jsonify({
+        'timestamp': datetime.now().isoformat(),
+        'system_healthy': True,
+        'api_configured': bool(raceresult_api.api_key and raceresult_api.event_id),
+        'api_connected': api_status['connected'],
+        'api_error': api_status['last_error'],
+        'readers': [
+            {
+                'id': reader_id,
+                'host': config.get('host'),
+                'port': config.get('port', 4001),
+                'connected': True,
+                'reads_count': stats.get('by_reader', {}).get(reader_id, 0),
+                'last_read': None
+            }
+            for reader_id, config in listener.readers.items()
+        ],
+        'buffered_count': stats.get('unsynced_reads', 0),
+        'total_reads': stats.get('reads_today', 0),
+        'raceresult': api_status
+    })
+
+@app.route('/api/sync/status')
+def sync_status():
+    """Status der letzten Synchronisierung"""
+    stats = db.get_stats()
+    api_status = raceresult_api.get_status()
+    
+    return jsonify({
+        'timestamp': datetime.now().isoformat(),
+        'api_connected': api_status['connected'],
+        'buffered_reads': stats.get('unsynced_reads', 0),
+        'total_synced_today': stats.get('reads_today', 0) - stats.get('unsynced_reads', 0),
+        'last_error': api_status.get('last_error'),
+        'event_id': api_status['event_id']
+    })
+
+# ==================== AUTOMATISCHE SYNC ALLE 10 SEKUNDEN ====================
+
+def _auto_sync_thread():
+    """Background-Thread für automatische Synchronisierung"""
+    while True:
+        try:
+            time.sleep(10)  # Alle 10 Sekunden
+            
+            # Nur wenn API verbunden ist
+            if raceresult_api.is_connected:
+                unsynced = db.get_unsynced_reads(limit=50)
+                
+                if unsynced:
+                    success, synced_ids, _ = raceresult_api.submit_reads(unsynced)
+                    
+                    if success and synced_ids:
+                        db.mark_synced(synced_ids)
+                        logger.info(f"🔄 Auto-Sync: {len(synced_ids)} Reads übertragen")
+        
+        except Exception as e:
+            logger.error(f"✗ Auto-Sync Fehler: {e}")
+
 # ==================== MAIN ====================
 
 if __name__ == '__main__':
@@ -1123,8 +1476,17 @@ if __name__ == '__main__':
         logger.info(f"💾 Datenbank: {DB_PATH}")
         logger.info(f"📡 Reader: {len(listener.readers)}")
         
-        # Starte Reader-Listener
+        # Starte Threads
         listener.start()
+        api_check_thread.start()
+        
+        # Starte Auto-Sync
+        auto_sync = threading.Thread(target=_auto_sync_thread, daemon=True)
+        auto_sync.start()
+        
+        # Initial API-Verbindung prüfen
+        logger.info("🔗 Prüfe RaceResult API-Verbindung...")
+        raceresult_api.check_connection()
         
         # Starte Flask
         logger.info("🌐 Starte Flask auf 0.0.0.0:5000")
