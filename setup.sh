@@ -10,7 +10,7 @@ echo "========================================="
 echo "📦 Update System..."
 sudo apt update
 sudo apt upgrade -y
-sudo apt install -y python3-pip sqlite3 nginx curl git build-essential python3-dev dphys
+sudo apt install -y python3-pip sqlite3 nginx curl git build-essential python3-dev dphys-swapfile
 
 # Schritt 2: Swap erhöhen
 echo "💾 Konfiguriere Swap..."
